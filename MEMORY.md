@@ -8,6 +8,7 @@
   - `user.name`: `joms`
   - `user.email`: `joms.madhousetech@gmail.com`
 - **SSH Key**: `~/.ssh/id_ed25519.pub` (`jom@Desk`)
+- **Commit Rule**: ⚠️ ONLY run `git commit` or `git push` when EXPLICITLY instructed by the user!
 
 ## 🛠️ Environment & Stack Specs
 - **Language**: Python 3.14 (`./venv/bin/python3`)

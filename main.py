@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
     QPushButton, QSlider, QFrame, QTextEdit
 )
+from PyQt6.QtGui import QKeySequence, QShortcut
 import mss
 from PIL import Image
 
@@ -91,8 +92,12 @@ class ScreenTipMasterOverlay(QWidget):
         self.box1_title = QLabel(f"[{self.box1_rect.width()}x{self.box1_rect.height()-38}px]")
         self.box1_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: normal;")
 
-        self.scan_btn = QPushButton("Scan & Solve")
+        self.scan_btn = QPushButton("Scan & Solve (Ctrl+G)")
         self.scan_btn.clicked.connect(self.trigger_scan)
+
+        # Global Shortcut: Ctrl+G
+        self.scan_shortcut = QShortcut(QKeySequence("Ctrl+G"), self)
+        self.scan_shortcut.activated.connect(self.trigger_scan)
 
         self.close_btn = QPushButton("✕ Exit (Esc)")
         self.close_btn.setStyleSheet("""
@@ -125,21 +130,17 @@ class ScreenTipMasterOverlay(QWidget):
             }
         """)
 
-        # Box 1 Resize Handle Grip
-        self.box1_grip = QLabel("◢", self.container)
+        # Box 1 Resize Handle Grip (Discrete & outside bottom-right corner)
+        self.box1_grip = QLabel("", self.container)
         self.box1_grip.setStyleSheet("""
             QLabel {
-                color: #ffffff;
-                background-color: rgba(15, 23, 42, 230);
-                border: 1px solid rgba(255, 255, 255, 0.3);
+                background-color: #38bdf8;
+                border: 2px solid #ffffff;
                 border-radius: 4px;
-                font-weight: bold;
-                font-size: 14px;
-                padding: 1px 4px;
             }
             QLabel:hover {
-                color: #38bdf8;
-                background-color: rgba(30, 41, 59, 250);
+                background-color: #ffffff;
+                border: 2px solid #38bdf8;
             }
         """)
         self.box1_grip.setCursor(Qt.CursorShape.SizeFDiagCursor)
@@ -282,12 +283,12 @@ class ScreenTipMasterOverlay(QWidget):
             self.box1_rect.height() - 38
         )
 
-        # Position Box 1 Resize Grip at bottom-right corner
+        # Position Discrete Resize Grip OUTSIDE bottom-right corner of Box 1 Lens
         self.box1_grip.setGeometry(
-            self.box1_rect.x() + self.box1_rect.width() - 22,
-            self.box1_rect.y() + self.box1_rect.height() - 22,
-            22,
-            22
+            self.box1_rect.x() + self.box1_rect.width() - 4,
+            self.box1_rect.y() + self.box1_rect.height() - 4,
+            12,
+            12
         )
 
         # Position Box 2 Solution HUD Window
@@ -398,6 +399,8 @@ def twoSum(nums: list[int], target: int) -> list[int]:
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape or event.key() == Qt.Key.Key_Q:
             QApplication.instance().quit()
+        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and event.key() == Qt.Key.Key_G:
+            self.trigger_scan()
 
 
 if __name__ == "__main__":
