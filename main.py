@@ -35,9 +35,10 @@ class ScreenTipMasterOverlay(QWidget):
         self.box1_rect = QRect(box1_x, start_y, 500, 320)
         self.box2_rect = QRect(box2_x, start_y, 480, 560)
 
-        # Drag state
+        # Drag & Resize state
         self.dragging_box1 = False
         self.dragging_box2 = False
+        self.resizing_box1 = False
         self.drag_start_pos = QPoint()
         self.box1_start_rect = QRect()
         self.box2_start_rect = QRect()
@@ -124,6 +125,26 @@ class ScreenTipMasterOverlay(QWidget):
             }
         """)
 
+        # Box 1 Resize Handle Grip
+        self.box1_grip = QLabel("◢", self.container)
+        self.box1_grip.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                background-color: rgba(15, 23, 42, 230);
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 14px;
+                padding: 1px 4px;
+            }
+            QLabel:hover {
+                color: #38bdf8;
+                background-color: rgba(30, 41, 59, 250);
+            }
+        """)
+        self.box1_grip.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.box1_grip.setToolTip("Drag to Resize Box 1")
+
         # ==========================================
         # BOX 2: SOLUTION HUD WIDGET
         # ==========================================
@@ -139,7 +160,7 @@ class ScreenTipMasterOverlay(QWidget):
         title_lbl.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: bold;")
         title_lbl.setCursor(Qt.CursorShape.SizeAllCursor)
 
-        # Opacity Slider
+        # Opacity Slider & Box 2 Close Button
         opacity_layout = QHBoxLayout()
         op_lbl = QLabel("Stealth:")
         op_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
@@ -150,8 +171,26 @@ class ScreenTipMasterOverlay(QWidget):
         self.slider.setFixedWidth(70)
         self.slider.valueChanged.connect(self.on_opacity_change)
 
+        self.box2_close_btn = QPushButton("✕")
+        self.box2_close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(239, 68, 68, 0.85);
+                color: #ffffff;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 3px 8px;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #ef4444;
+            }
+        """)
+        self.box2_close_btn.setToolTip("Close Solution HUD & Exit (Esc)")
+        self.box2_close_btn.clicked.connect(QApplication.instance().quit)
+
         opacity_layout.addWidget(op_lbl)
         opacity_layout.addWidget(self.slider)
+        opacity_layout.addWidget(self.box2_close_btn)
 
         header_layout.addWidget(title_lbl)
         header_layout.addStretch()
@@ -243,6 +282,14 @@ class ScreenTipMasterOverlay(QWidget):
             self.box1_rect.height() - 38
         )
 
+        # Position Box 1 Resize Grip at bottom-right corner
+        self.box1_grip.setGeometry(
+            self.box1_rect.x() + self.box1_rect.width() - 22,
+            self.box1_rect.y() + self.box1_rect.height() - 22,
+            22,
+            22
+        )
+
         # Position Box 2 Solution HUD Window
         self.box2_card.setGeometry(self.box2_rect)
 
@@ -305,10 +352,14 @@ def twoSum(nums: list[int], target: int) -> list[int]:
         self.result_view.setHtml(html)
         self.scan_btn.setText("Scan & Solve")
 
-    # Mouse Dragging Handlers
+    # Mouse Dragging & Resizing Handlers
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
-        if self.box1_bar.geometry().contains(pos) or self.box1_lens.geometry().contains(pos):
+        if self.box1_grip.geometry().contains(pos):
+            self.resizing_box1 = True
+            self.drag_start_pos = pos
+            self.box1_start_rect = QRect(self.box1_rect)
+        elif self.box1_bar.geometry().contains(pos) or self.box1_lens.geometry().contains(pos):
             self.dragging_box1 = True
             self.drag_start_pos = pos
             self.box1_start_rect = QRect(self.box1_rect)
@@ -319,7 +370,14 @@ def twoSum(nums: list[int], target: int) -> list[int]:
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
-        if self.dragging_box1:
+        if self.resizing_box1:
+            delta = pos - self.drag_start_pos
+            new_w = max(220, self.box1_start_rect.width() + delta.x())
+            new_h = max(140, self.box1_start_rect.height() + delta.y())
+            self.box1_rect.setWidth(new_w)
+            self.box1_rect.setHeight(new_h)
+            self.reposition_widgets()
+        elif self.dragging_box1:
             delta = pos - self.drag_start_pos
             new_x = max(0, self.box1_start_rect.x() + delta.x())
             new_y = max(0, self.box1_start_rect.y() + delta.y())
@@ -335,6 +393,7 @@ def twoSum(nums: list[int], target: int) -> list[int]:
     def mouseReleaseEvent(self, event):
         self.dragging_box1 = False
         self.dragging_box2 = False
+        self.resizing_box1 = False
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape or event.key() == Qt.Key.Key_Q:
