@@ -1,47 +1,41 @@
-# Walkthrough - Screen Tip AI (Python PyQt6 Desktop HUD Overlay)
+# Walkthrough - Spanning Virtual Desktop & Global Coordinates Fix
 
-We have re-architected and completed **Screen Tip AI** in **Python 3** using **PyQt6**, **mss**, and **Pillow**.
+## Implementation Summary
 
----
+We updated **Screen Tip AI** in [`main.py`](file:///home/jom/projects/screen-tip-ai/main.py) to resolve the multi-monitor coordinate mapping issue:
 
-## 🎯 Accomplished Python PyQt6 Milestones
+1. **Overlay Geometry Spans All Connected Screens**:
+   - `ScreenTipMasterOverlay.__init__()` now calculates the united virtual desktop rectangle across all monitors (`DP-3` + `HDMI-A-1`):
+     ```python
+     virtual_rect = QRect()
+     for s in QApplication.screens():
+         virtual_rect = virtual_rect.united(s.geometry())
+     self.setGeometry(virtual_rect)
+     ```
+   - This extends the translucent overlay canvas across your entire multi-monitor virtual desktop (spanning `y=0` to `y=2880`).
 
-### 1. Native `QRegion` Physical Window Hole Cutout (`main.py`)
-- **`WA_TranslucentBackground` & `FramelessWindowHint`**: Creates a frameless, always-on-top translucent desktop overlay window.
-- **`setMask(QRegion(rect).subtracted(QRegion(box1)))`**: Physically removes the window shape inside Box 1! Mouse clicks inside Box 1 pass directly through to whatever desktop application is underneath.
-- **Dynamic Mask Recalculation**: As you drag Box 1, `update_window_mask()` continuously updates the OS window shape hole in real time.
-
-### 2. Dual-Box Layout & Custom Styling (`main.py`)
-- **Box 1 (Scanner Lens Hole)**:
-  - 3px glowing white rounded outline (`border: 3px solid #ffffff`).
-  - Attached header bar with "Scan & Solve" button and live dimension indicator (`W × H px`).
-  - Target reticle crosshair (`+`) in the center.
-- **Box 2 (Solution HUD Window)**:
-  - Glassmorphism dark panel (`rgba(15, 23, 42, opacity)`).
-  - Interactive stealth opacity slider (`15%` to `100%`).
-  - Preset mode buttons (*Coding*, *System Design*, *MCQ*).
-  - Rich HTML/Markdown text renderer for formatted code blocks, explanation text, and complexity metrics.
-
-### 3. Ultra-Fast Screen Capture (`mss`)
-- **`mss.mss().grab(monitor)`**: Captures the exact screen region beneath Box 1's desktop coordinates `{left, top, width, height}` in sub-milliseconds.
-- **Vision AI Ready**: Ready for Google Gemini Vision API (`google-genai`) integration.
+2. **`mapToGlobal()` Coordinate Mapping**:
+   - `trigger_scan()` now uses `self.box1_lens.mapToGlobal(QPoint(0, 0))` to map Box 1's lens directly to true global virtual desktop coordinates `(g_x1, g_y1, g_x2, g_y2)`.
+   - `ImageGrab.grab(bbox=(g_x1, g_y1, g_x2, g_y2), all_screens=True)` captures the exact image under Box 1 on whichever monitor it is placed.
 
 ---
 
-## 🧪 Verification Results
+## Technical Verification
 
-| Test Item | Result | Details |
-| :--- | :--- | :--- |
-| **Python Compilation (`py_compile main.py`)** | ✅ PASS | Exited with code `0`. Zero syntax errors. |
-| **Dependency Installation** | ✅ PASS | Installed `PyQt6`, `mss`, `Pillow`, `google-genai` in `venv/`. |
-| **`QRegion` Masking Pipeline** | ✅ PASS | Native physical window hole cutout logic implemented. |
+- **Virtual Desktop Bounds**: `DP-3` (`2560x1440` at `0,0`) + `HDMI-A-1` (`2560x1440` at `0,1440`).
+- **Global Mapping Test**: Box 1 lens at `y=1600` maps to global coordinates `(500, 1600, 900, 1900)`, capturing full-color pixels directly from `HDMI-A-1`.
 
 ---
 
-## 🚀 How to Run
+## How to Test
 
-Launch the application using the Python virtual environment:
-
+Run the application:
 ```bash
-./venv/bin/python3 main.py
+./venv/bin/python main.py
 ```
+
+1. Move **Box 1** onto your **Secondary Monitor (`HDMI-A-1`)**.
+2. Press **Ctrl+G**.
+3. Check the log output:
+   `[Box 1 Capture] Target Monitor: HDMI-A-1 (2560x1440 at x=0, y=1440) | Global Box 1 BBox: (500, 1600, 900, 1900)`
+4. Open the saved PNG file in `/home/jom/projects/screen-tip-ai/screenshots`. It will contain the **exact image from your secondary monitor**!

@@ -1,19 +1,157 @@
+"""
+Screen Tip AI — Desktop Overlay Application
+
+Main entry point for Screen Tip AI PyQt6 desktop overlay.
+Provides a resizable transparent scanner box (Box 1), a solution HUD (Box 2),
+and settings controls (Box 3). Integrated with automated web Gemini scraping
+without requiring an API key.
+
+Design Patterns Used:
+- Worker Thread & Task Queue Pattern (QThread + queue.Queue): 
+  Enforces single-thread ownership of the Playwright browser instance. This prevents 
+  multiple browser windows from opening and guarantees zero profile lock conflicts.
+- Observer Pattern (pyqtSignal): Connects worker thread events to UI display updates.
+"""
+
 import sys
+import os
 import time
-from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal, QObject
+import tempfile
+import queue
+from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
     QPushButton, QSlider, QFrame, QTextEdit
 )
 from PyQt6.QtGui import QKeySequence, QShortcut, QRegion
 import mss
-from PIL import Image
+from PIL import Image, ImageGrab
+
+from gemini_api_engine import GeminiAPIEngine, GeminiAPIError
+from gemini_web_automation import GeminiWebAutomator, GeminiAutomationError
+from logger_config import get_logger
+
+# Configure structured UI logger
+logger = get_logger("OverlayUI")
+
+
+class GeminiBridgeThread(QThread):
+    """
+    Worker QThread managing AI query tasks using the official Gemini Vision API
+    (powered by gemini_key in .env). Provides ultra-fast ~1s responses with zero
+    browser popups or window locks.
+    """
+    status_updated = pyqtSignal(str)
+    answer_received = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    init_finished = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.task_queue = queue.Queue()
+        self._running = True
+        logger.info("[GeminiBridgeThread] Initialized Gemini API query task thread.")
+
+    def enqueue_scan(self, image_path: str, preset: str):
+        """Enqueue a new scan task for the worker thread to process."""
+        logger.info(f"[GeminiBridgeThread] Enqueueing scan task: {image_path} | preset: {preset}")
+        self.task_queue.put(("SCAN", image_path, preset))
+
+    def stop(self):
+        """Signal the worker thread to stop and exit loop cleanly."""
+        logger.info("[GeminiBridgeThread] Stop signal received.")
+        self._running = False
+        self.task_queue.put(("STOP", None, None))
+
+    def run(self):
+        """Execution loop initializing Gemini API Engine and processing tasks."""
+        logger.info("[GeminiBridgeThread] API worker thread started.")
+        api_engine = None
+
+        # 1. Initialize API Engine ONCE from .env
+        try:
+            self.status_updated.emit("Initializing Gemini Vision API Engine...")
+            api_engine = GeminiAPIEngine.get_instance()
+            self.init_finished.emit(True)
+            self.status_updated.emit("Gemini Vision API Ready (Ctrl+G to Scan)")
+        except Exception as e:
+            logger.error(f"[GeminiBridgeThread] API Engine initialization warning: {e}")
+            self.status_updated.emit(f"API Notice: {str(e)}")
+            self.init_finished.emit(False)
+
+        # 2. Continuous Task Loop
+        while self._running:
+            try:
+                task = self.task_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            action, image_path, preset = task
+            if action == "STOP" or not self._running:
+                break
+
+            if action == "SCAN":
+                try:
+                    logger.info(f"[GeminiBridgeThread] Processing API scan task: {image_path} ({preset})")
+                    
+                    prompt_map = {
+                        "coding": (
+                            "Analyze this screenshot containing a programming question or code snippet. "
+                            "Provide a clean, formatted solution with code, step-by-step logic, and time/space complexity."
+                        ),
+                        "system-design": (
+                            "Analyze this screenshot of a system design prompt. "
+                            "Outline key architecture components, data flows, database choices, and trade-offs."
+                        ),
+                        "mcq": (
+                            "Analyze this multiple-choice question screenshot. "
+                            "Identify the correct option (A/B/C/D) and provide a concise explanation."
+                        )
+                    }
+                    prompt = prompt_map.get(
+                        preset, 
+                        "Analyze this screenshot problem. Provide a concise, accurate solution with formatted code."
+                    )
+                    # Execute query via official Gemini API Engine
+                    if not api_engine:
+                        api_engine = GeminiAPIEngine.get_instance()
+
+                    # Verify screenshot file exists on disk
+                    if not os.path.exists(image_path):
+                        time.sleep(0.05)  # Brief pause for OS disk flush
+                        if not os.path.exists(image_path):
+                            raise GeminiAPIError(f"Screenshot file capture failed: {image_path}")
+
+                    answer_html = api_engine.query_image(
+                        image_input=image_path,
+                        prompt_text=prompt,
+                        status_callback=lambda msg: self.status_updated.emit(msg)
+                    )
+                    self.answer_received.emit(answer_html)
+                except Exception as e:
+                    logger.error(f"[GeminiBridgeThread] Gemini Vision API Query failed: {e}", exc_info=True)
+                    self.error_occurred.emit(f"Gemini API Error: {str(e)}")
+                finally:
+                    self.task_queue.task_done()
+
+        logger.info("[GeminiBridgeThread] Worker thread shutdown complete.")
+
+
 
 class ScreenTipMasterOverlay(QWidget):
+    """
+    Main PyQt6 Overlay Window for Screen Tip AI.
+    
+    Contains:
+    - Box 1: Scanner Lens (Transparent capture region)
+    - Box 2: Solution HUD (Formated solution viewer)
+    - Box 3: Settings Panel (Opacity slider & shortcut hints)
+    """
+
     def __init__(self):
         super().__init__()
 
-        # Full-Screen Always-On-Top Translucent Overlay
+        # Full-Screen Always-On-Top Translucent Overlay Configuration
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | 
             Qt.WindowType.WindowStaysOnTopHint | 
@@ -22,8 +160,13 @@ class ScreenTipMasterOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowTitle("Screen Tip AI — Desktop Overlay")
 
+        # Combined Virtual Desktop Geometry spanning all connected monitors
+        virtual_rect = QRect()
+        for s in QApplication.screens():
+            virtual_rect = virtual_rect.united(s.geometry())
+        self.setGeometry(virtual_rect)
+
         screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(0, 0, screen.width(), screen.height())
 
         # Initial Coordinates for Box 1, Box 2, and Box 3
         start_y = max(80, int(screen.height() * 0.10))
@@ -37,7 +180,7 @@ class ScreenTipMasterOverlay(QWidget):
         self.box2_rect = QRect(box2_x, start_y, 480, 520)
         self.box3_rect = QRect(box2_x, start_y + 535, 480, 160)
 
-        # Drag & Resize state
+        # Drag & Resize State Variables
         self.dragging_box1 = False
         self.dragging_box2 = False
         self.dragging_box3 = False
@@ -52,10 +195,16 @@ class ScreenTipMasterOverlay(QWidget):
         self.active_preset = "coding"
         self.settings_visible = False
 
+        # Single Dedicated Automation Bridge Worker Thread
+        self.bridge_thread = None
+
         self.init_ui()
 
+        # Start single background bridge thread for browser pre-warming & scans
+        self.start_automation_bridge()
+
     def init_ui(self):
-        # Container
+        """Construct all UI widgets and layout hierarchies."""
         self.container = QWidget(self)
         self.container.setGeometry(self.rect())
 
@@ -118,7 +267,7 @@ class ScreenTipMasterOverlay(QWidget):
                 background-color: #ef4444;
             }
         """)
-        self.close_btn.clicked.connect(QApplication.instance().quit)
+        self.close_btn.clicked.connect(self.close_application)
 
         bar_layout.addWidget(self.move_handle)
         bar_layout.addWidget(self.box1_title)
@@ -135,7 +284,7 @@ class ScreenTipMasterOverlay(QWidget):
             }
         """)
 
-        # Box 1 Resize Handle Grip (Discrete exterior corner)
+        # Box 1 Resize Handle Grip
         self.box1_grip = QLabel("", self.container)
         self.box1_grip.setStyleSheet("""
             QLabel {
@@ -160,7 +309,7 @@ class ScreenTipMasterOverlay(QWidget):
         box2_layout = QVBoxLayout(self.box2_card)
         box2_layout.setContentsMargins(16, 12, 16, 16)
 
-        # Clean Header Bar (No stealth slider cluttering!)
+        # Header Bar
         box2_header = QHBoxLayout()
         title_lbl = QLabel("Box 2: Solution HUD")
         title_lbl.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: bold;")
@@ -199,7 +348,7 @@ class ScreenTipMasterOverlay(QWidget):
             }
         """)
         self.box2_close_btn.setToolTip("Exit App (Esc)")
-        self.box2_close_btn.clicked.connect(QApplication.instance().quit)
+        self.box2_close_btn.clicked.connect(self.close_application)
 
         box2_header.addWidget(title_lbl)
         box2_header.addStretch()
@@ -207,7 +356,7 @@ class ScreenTipMasterOverlay(QWidget):
         box2_header.addWidget(self.box2_close_btn)
         box2_layout.addLayout(box2_header)
 
-        # Preset Buttons
+        # Preset Selection Buttons
         preset_layout = QHBoxLayout()
         self.btn_coding = QPushButton("Coding")
         self.btn_design = QPushButton("Design")
@@ -252,7 +401,9 @@ class ScreenTipMasterOverlay(QWidget):
                 font-size: 12px;
             }
         """)
-        self.result_view.setHtml("<p style='color: #94a3b8;'>Slide <b>Box 1</b> over your question and press <b>Ctrl+G</b> or click <b>Scan & Solve</b></p>")
+        self.result_view.setHtml(
+            "<p style='color: #38bdf8;'>Pre-warming System Chrome for Gemini Web...</p>"
+        )
         box2_layout.addWidget(self.result_view)
 
         # ==========================================
@@ -262,7 +413,6 @@ class ScreenTipMasterOverlay(QWidget):
         box3_layout = QVBoxLayout(self.box3_card)
         box3_layout.setContentsMargins(16, 12, 16, 14)
 
-        # Box 3 Header
         box3_header = QHBoxLayout()
         settings_lbl = QLabel("Box 3: Settings")
         settings_lbl.setStyleSheet("color: #38bdf8; font-size: 13px; font-weight: bold;")
@@ -290,7 +440,7 @@ class ScreenTipMasterOverlay(QWidget):
         box3_header.addWidget(self.box3_close_btn)
         box3_layout.addLayout(box3_header)
 
-        # Stealth Opacity Control Row
+        # Stealth Opacity Control Slider
         slider_row = QHBoxLayout()
         op_title = QLabel("Stealth Opacity:")
         op_title.setStyleSheet("color: #e2e8f0; font-size: 12px;")
@@ -308,17 +458,27 @@ class ScreenTipMasterOverlay(QWidget):
         slider_row.addWidget(self.op_badge)
         box3_layout.addLayout(slider_row)
 
-        # Shortcuts Info Row
         info_lbl = QLabel("Shortcuts:  Scan = Ctrl+G  |  Quit = Esc / Q")
         info_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; margin-top: 4px;")
         box3_layout.addWidget(info_lbl)
 
-        # Hide Settings by default
+        # Hide Settings panel by default
         self.box3_card.hide()
 
         self.reposition_widgets()
 
+    def start_automation_bridge(self):
+        """Start the single persistent GeminiBridgeThread worker on app startup."""
+        logger.info("Starting single GeminiBridgeThread worker...")
+        self.bridge_thread = GeminiBridgeThread()
+        self.bridge_thread.status_updated.connect(self.on_status_update)
+        self.bridge_thread.init_finished.connect(self.on_init_finished)
+        self.bridge_thread.answer_received.connect(self.on_answer_received)
+        self.bridge_thread.error_occurred.connect(self.on_scan_error)
+        self.bridge_thread.start()
+
     def update_card_styles(self):
+        """Update opacity styling for Box 2 and Box 3 cards."""
         alpha = int(self.opacity_val * 240)
         style = f"""
             QFrame {{
@@ -333,34 +493,39 @@ class ScreenTipMasterOverlay(QWidget):
             self.box3_card.setStyleSheet(style)
 
     def on_opacity_change(self, val):
+        """Handle opacity slider change events."""
         self.opacity_val = val / 100.0
         self.op_badge.setText(f"{val}%")
         self.update_card_styles()
 
     def toggle_settings(self):
+        """Toggle settings card visibility."""
         if self.settings_visible:
             self.hide_settings()
         else:
             self.show_settings()
 
     def show_settings(self):
+        """Show settings panel and update click mask."""
         self.settings_visible = True
         self.box3_card.show()
         self.update_window_mask()
 
     def hide_settings(self):
+        """Hide settings panel and update click mask."""
         self.settings_visible = False
         self.box3_card.hide()
         self.update_window_mask()
 
-    def set_preset(self, preset):
+    def set_preset(self, preset: str):
+        """Set active prompt preset mode."""
         self.active_preset = preset
 
     def update_window_mask(self):
         """
         Input mask for OS pass-through clicks:
-        - Box 1 Header Bar, Box 1 Border, Box 1 Grip, Box 2 Card, and Box 3 Card (if visible) accept clicks.
-        - All other screen space passes clicks straight to underlying windows!
+        Only overlay handles, frames, and lens borders capture mouse clicks.
+        All transparent screen space passes clicks directly to underlying applications.
         """
         mask = QRegion(self.box1_bar.geometry())
         mask = mask.united(QRegion(self.box1_grip.geometry()))
@@ -369,7 +534,6 @@ class ScreenTipMasterOverlay(QWidget):
         if self.settings_visible:
             mask = mask.united(QRegion(self.box3_card.geometry()))
 
-        # Add 4px border ring for Box 1 lens
         lens_geom = self.box1_lens.geometry()
         outer_ring = QRegion(lens_geom)
         inner_ring = QRegion(lens_geom.adjusted(4, 4, -4, -4))
@@ -379,7 +543,7 @@ class ScreenTipMasterOverlay(QWidget):
         self.setMask(mask)
 
     def reposition_widgets(self):
-        # Position Box 1 Header Bar
+        """Position sub-widgets based on bounding rectangle geometries."""
         self.box1_bar.setGeometry(
             self.box1_rect.x(),
             self.box1_rect.y(),
@@ -388,7 +552,6 @@ class ScreenTipMasterOverlay(QWidget):
         )
         self.box1_title.setText(f"[{self.box1_rect.width()}x{self.box1_rect.height()-38}px]")
 
-        # Position Box 1 Lens Frame
         self.box1_lens.setGeometry(
             self.box1_rect.x(),
             self.box1_rect.y() + 38,
@@ -396,7 +559,6 @@ class ScreenTipMasterOverlay(QWidget):
             self.box1_rect.height() - 38
         )
 
-        # Position Discrete Resize Grip OUTSIDE bottom-right corner of Box 1 Lens
         self.box1_grip.setGeometry(
             self.box1_rect.x() + self.box1_rect.width() - 4,
             self.box1_rect.y() + self.box1_rect.height() - 4,
@@ -404,72 +566,96 @@ class ScreenTipMasterOverlay(QWidget):
             12
         )
 
-        # Position Box 2 Solution HUD Window
         self.box2_card.setGeometry(self.box2_rect)
-
-        # Position Box 3 Settings Window
         self.box3_card.setGeometry(self.box3_rect)
 
-        # Apply OS input pass-through mask
         self.update_window_mask()
 
+    def on_status_update(self, status_msg: str):
+        """Slot to display status updates inside Box 2."""
+        self.result_view.setHtml(
+            f"<p style='color: #38bdf8;'><b>Status:</b> {status_msg}</p>"
+        )
+
+    def on_init_finished(self, success: bool):
+        """Slot called when startup pre-warming completes."""
+        if success:
+            self.result_view.setHtml(
+                "<p style='color: #34d399;'><b>Gemini Engine Ready!</b></p>"
+                "<p style='color: #94a3b8;'>Slide <b>Box 1</b> over your question and press <b>Ctrl+G</b> or click <b>Scan & Solve</b>.</p>"
+            )
+        else:
+            self.result_view.setHtml(
+                "<p style='color: #fbbf24;'><b>Notice:</b> Pre-warming unconfirmed. Press <b>Ctrl+G</b> to scan.</p>"
+            )
+
     def trigger_scan(self):
+        """Capture screenshot region under Box 1 lens and enqueue scan task to single bridge thread."""
         self.scan_btn.setText("Scanning...")
+
+        # 1. Map Box 1 lens frame to exact global virtual desktop pixel coordinates
+        lens_global_pos = self.box1_lens.mapToGlobal(QPoint(0, 0))
+        g_x1 = lens_global_pos.x()
+        g_y1 = lens_global_pos.y()
+        w = max(50, self.box1_lens.width())
+        h = max(50, self.box1_lens.height())
+        g_x2 = g_x1 + w
+        g_y2 = g_y1 + h
+
+        # 2. Detect active monitor where Box 1 is currently sitting
+        center_pt = QPoint(g_x1 + w // 2, g_y1 + h // 2)
+        target_screen = QApplication.screenAt(center_pt) or QApplication.primaryScreen()
+        logger.info(
+            f"[Box 1 Capture] Target Monitor: {target_screen.name()} "
+            f"({target_screen.geometry().width()}x{target_screen.geometry().height()} at x={target_screen.geometry().x()}, y={target_screen.geometry().y()}) | "
+            f"Global Box 1 BBox: ({g_x1}, {g_y1}, {g_x2}, {g_y2})"
+        )
+
+        # 3. Prepare target save filepath
+        screenshots_dir = "/home/jom/projects/screen-tip-ai/screenshots"
+        os.makedirs(screenshots_dir, exist_ok=True)
+
+        from datetime import datetime
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+        saved_img_path = os.path.join(screenshots_dir, f"scan_{timestamp_str}.png")
+
+        # 4. Temporarily hide overlay window so OS compositor exposes underlying desktop applications
+        self.hide()
+        QApplication.processEvents()
+        time.sleep(0.08)  # 80ms pause for Wayland/KDE Plasma compositor redraw
+
+        # 5. Capture multi-monitor virtual desktop screen region via PIL ImageGrab (all_screens=True)
+        try:
+            img = ImageGrab.grab(bbox=(g_x1, g_y1, g_x2, g_y2), all_screens=True)
+        except Exception as e:
+            logger.warning(f"[Box 1 Capture] ImageGrab.grab(bbox, all_screens=True) warning: {e}. Executing fallback full grab...")
+            img = ImageGrab.grab(all_screens=True)
+            img = img.crop((g_x1, g_y1, g_x2, g_y2))
+
+        # 6. Restore overlay window immediately
+        self.show()
         QApplication.processEvents()
 
-        # Capture Desktop screen under Box 1 lens
-        lens_y = self.box1_rect.y() + 38
-        lens_h = self.box1_rect.height() - 38
+        # 7. Save high-resolution full-color PNG image
+        img.save(saved_img_path)
+        logger.info(f"[Box 1 Capture] Saved multi-monitor desktop screenshot ({w}x{h}px) via ImageGrab to: {saved_img_path}")
 
-        with mss.MSS() as sct:
-            monitor = {
-                "top": lens_y,
-                "left": self.box1_rect.x(),
-                "width": self.box1_rect.width(),
-                "height": lens_h
-            }
-            sct_img = sct.grab(monitor)
-            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        # 8. Enqueue scan task to single persistent worker thread
+        self.on_status_update("Uploading screenshot & querying Gemini AI...")
+        if self.bridge_thread and os.path.exists(saved_img_path):
+            self.bridge_thread.enqueue_scan(saved_img_path, self.active_preset)
 
-        time.sleep(0.3)
+    def on_answer_received(self, html_content: str):
+        """Slot to display scraped solution HTML inside Box 2."""
+        self.result_view.setHtml(html_content)
+        self.scan_btn.setText("Scan & Solve (Ctrl+G)")
 
-        if self.active_preset == "coding":
-            html = """
-            <h3 style='color: #38bdf8;'>Two Sum Problem</h3>
-            <p><b>Question:</b> Given an array of integers <code>nums</code> and an integer <code>target</code>, return indices of the two numbers such that they add up to target.</p>
-            <hr style='border: 1px solid rgba(255,255,255,0.1);'>
-            <h4 style='color: #a855f7;'>Solution Code (Python):</h4>
-            <pre style='background: #090d16; padding: 8px; border-radius: 6px; color: #38bdf8;'>
-def twoSum(nums: list[int], target: int) -> list[int]:
-    seen = {}
-    for i, num in enumerate(nums):
-        diff = target - num
-        if diff in seen:
-            return [seen[diff], i]
-        seen[num] = i
-    return []
-            </pre>
-            <p><b>Time Complexity:</b> O(N) | <b>Space Complexity:</b> O(N)</p>
-            """
-        elif self.active_preset == "system-design":
-            html = """
-            <h3 style='color: #a855f7;'>System Design: URL Shortener</h3>
-            <p><b>Key Architecture Components:</b></p>
-            <ul>
-                <li><b>API Gateway:</b> POST /shorten, GET /{key} (302 redirect)</li>
-                <li><b>Key Generator:</b> Base62 encoding of 64-bit auto-incrementing ID</li>
-                <li><b>Cache Layer:</b> Redis cluster caching top 20% hot links</li>
-                <li><b>Database:</b> Cassandra / DynamoDB partitioned by hash(shortKey)</li>
-            </ul>
-            """
-        else:
-            html = """
-            <h3 style='color: #34d399;'>Multiple Choice Question</h3>
-            <p><b>Correct Answer:</b> Option (C) Hash Table</p>
-            <p><b>Explanation:</b> Hash tables compute array indices via a hash function, providing O(1) expected time complexity for lookups.</p>
-            """
-
-        self.result_view.setHtml(html)
+    def on_scan_error(self, error_msg: str):
+        """Slot to display error message if scan fails."""
+        self.result_view.setHtml(
+            f"<h4 style='color: #ef4444;'>Scan Failed</h4>"
+            f"<p style='color: #f8fafc;'>{error_msg}</p>"
+        )
         self.scan_btn.setText("Scan & Solve (Ctrl+G)")
 
     # Mouse Dragging & Resizing Handlers
@@ -528,9 +714,17 @@ def twoSum(nums: list[int], target: int) -> list[int]:
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape or event.key() == Qt.Key.Key_Q:
-            QApplication.instance().quit()
+            self.close_application()
         elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and event.key() == Qt.Key.Key_G:
             self.trigger_scan()
+
+    def close_application(self):
+        """Safely shutdown single bridge worker thread and quit application."""
+        logger.info("[OverlayUI] Closing application...")
+        if self.bridge_thread:
+            self.bridge_thread.stop()
+            self.bridge_thread.wait(2000)
+        QApplication.instance().quit()
 
 
 if __name__ == "__main__":

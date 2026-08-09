@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+screenshots/
+.env
+.screen_tip_gemini_profile/
+.screen_tip_ai/
